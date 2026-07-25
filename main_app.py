@@ -9,8 +9,9 @@ Para desplegarlo, ubica ``main.py``, ``requirements.txt`` y
 """
 
 from pathlib import Path
+import re
 
-from groq import Groq
+from groq import APIConnectionError, APIStatusError, Groq
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -28,7 +29,10 @@ st.set_page_config(
     layout="wide",
 )
 
-MODELO_GROQ = "llama-3.3-70b-versatile"
+MODELOS_GROQ = {
+    "Llama 3.3 70B — solicitado": "llama-3.3-70b-versatile",
+    "GPT-OSS 120B — alternativa recomendada": "openai/gpt-oss-120b",
+}
 RUTA_DATOS = Path(__file__).resolve().parent / "energia_renovable.csv"
 
 COLORES_TECNOLOGIA = {
@@ -204,8 +208,9 @@ def construir_contexto_ia(
     reporte_tecnologia: pd.DataFrame,
     reporte_operador: pd.DataFrame,
     reporte_estado: pd.DataFrame,
+    pregunta: str,
 ) -> str:
-    """Convierte cálculos y registros filtrados en evidencia para Llama."""
+    """Convierte cálculos y registros relevantes en evidencia compacta."""
     variables_numericas = [
         "Capacidad_Instalada_MW",
         "Generacion_Diaria_MWh",
@@ -250,10 +255,35 @@ def construir_contexto_ia(
         "Fecha_Entrada_Operacion"
     ].dt.strftime("%Y-%m-%d")
 
-    # El dataset original tiene 500 registros. El límite protege la aplicación
-    # si en el futuro se carga un archivo mucho más grande.
-    limite_registros = 500
-    registros_enviados = registros.head(limite_registros)
+    # No enviamos las 500 filas en cada turno. Los reportes agregados contienen
+    # todo el filtro; para el detalle elegimos proyectos relevantes y cualquier
+    # ID mencionado por el usuario. Esto reduce costo y evita límites de tokens.
+    ids_mencionados = sorted(
+        set(re.findall(r"PLANT_\d+", pregunta.upper()))
+    )
+    registros_por_id = registros[
+        registros["ID_Proyecto"].str.upper().isin(ids_mencionados)
+    ]
+
+    grupos_destacados = [
+        registros_por_id,
+        registros.nlargest(12, "Generacion_por_MUSD"),
+        registros.nsmallest(12, "Generacion_por_MUSD"),
+        registros.nlargest(10, "Generacion_Diaria_MWh"),
+        registros.nlargest(10, "Capacidad_Instalada_MW"),
+        registros.nlargest(10, "Inversion_Inicial_MUSD"),
+    ]
+    limite_registros = 60
+    registros_enviados = (
+        pd.concat(grupos_destacados, ignore_index=True)
+        .drop_duplicates(subset=["ID_Proyecto"])
+        .head(limite_registros)
+    )
+    ids_no_encontrados = sorted(
+        set(ids_mencionados).difference(
+            registros_por_id["ID_Proyecto"].str.upper()
+        )
+    )
 
     return f"""
 CONTEXTO ANALÍTICO DEL DASHBOARD
@@ -302,12 +332,85 @@ ESTADÍSTICAS DESCRIPTIVAS
 MATRIZ DE CORRELACIONES DE PEARSON
 {correlaciones.to_csv()}
 
-REGISTROS INDIVIDUALES
+REGISTROS INDIVIDUALES DESTACADOS
 - Registros enviados: {len(registros_enviados)} de {len(registros)}
-- Si el total es mayor que {limite_registros}, los registros individuales están
-  truncados, aunque los reportes agregados sí utilizan todo el filtro.
+- IDs solicitados por el usuario: {ids_mencionados or "ninguno"}
+- IDs solicitados no encontrados en el filtro: {ids_no_encontrados or "ninguno"}
+- Se incluyen proyectos extremos en productividad, generación, capacidad e
+  inversión. Los reportes agregados sí utilizan todos los proyectos filtrados.
 {registros_enviados.round(4).to_csv(index=False)}
 """
+
+
+def extraer_detalle_error(error: APIStatusError, api_key: str) -> str:
+    """Obtiene el mensaje seguro devuelto por la API sin mostrar la clave."""
+    cuerpo = getattr(error, "body", None)
+    detalle = ""
+
+    if isinstance(cuerpo, dict):
+        contenido = cuerpo.get("error", cuerpo)
+        if isinstance(contenido, dict):
+            mensaje = contenido.get("message", "")
+            tipo = contenido.get("type", "")
+            detalle = f"{tipo}: {mensaje}".strip(": ")
+        else:
+            detalle = str(contenido)
+
+    if not detalle:
+        detalle = str(error)
+
+    if api_key:
+        detalle = detalle.replace(api_key, "[API KEY OCULTA]")
+    return detalle
+
+
+def mostrar_error_groq(
+    error: Exception,
+    api_key: str,
+    modelo: str,
+) -> None:
+    """Muestra un diagnóstico accionable de un error de Groq."""
+    if isinstance(error, APIStatusError):
+        estado = getattr(error, "status_code", None)
+        guias = {
+            400: "La solicitud contiene un parámetro no aceptado.",
+            401: "La API key es inválida, expiró o fue copiada con espacios.",
+            403: "La cuenta o proyecto no tiene permiso para usar el modelo.",
+            404: "El modelo no está disponible para esta cuenta.",
+            413: "El contexto enviado es demasiado grande.",
+            422: "Groq no pudo procesar semánticamente la solicitud.",
+            429: "Se alcanzó un límite de solicitudes o tokens. Espera y reintenta.",
+            498: "La capacidad del nivel de servicio está temporalmente llena.",
+            500: "Groq presentó un error interno.",
+            502: "Groq recibió una respuesta inválida de un servicio interno.",
+            503: "Groq está temporalmente no disponible.",
+        }
+        recomendacion = guias.get(
+            estado,
+            "Consulta el detalle técnico devuelto por Groq.",
+        )
+        st.error(f"Groq respondió con HTTP {estado}. {recomendacion}")
+        st.code(extraer_detalle_error(error, api_key), language=None)
+
+        request_id = getattr(error, "request_id", None)
+        if request_id:
+            st.caption(f"Request ID de Groq: {request_id}")
+
+        if estado in {403, 404} and modelo == "llama-3.3-70b-versatile":
+            st.info(
+                "Selecciona GPT-OSS 120B en la barra lateral. Groq lo recomienda "
+                "como reemplazo de Llama 3.3 70B."
+            )
+    elif isinstance(error, APIConnectionError):
+        st.error(
+            "No fue posible conectarse con Groq. Revisa la conexión de red "
+            "del servidor o inténtalo nuevamente."
+        )
+    else:
+        st.error(
+            "Ocurrió un error local al preparar la consulta. "
+            f"Tipo: {type(error).__name__}."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -336,8 +439,7 @@ def limpiar_chat() -> None:
 # ---------------------------------------------------------------------------
 st.title("⚡ Dashboard inteligente de energías renovables")
 st.caption(
-    "EDA interactivo y asistente analítico conectado a "
-    f"`{MODELO_GROQ}` mediante Groq."
+    "EDA interactivo y asistente analítico conectado a Groq."
 )
 
 archivo_subido = st.sidebar.file_uploader(
@@ -391,12 +493,33 @@ with st.sidebar:
 
     st.divider()
     st.header("Asistente con Groq")
+    nombre_modelo = st.selectbox(
+        "Modelo de interpretación",
+        options=list(MODELOS_GROQ.keys()),
+    )
+    modelo_seleccionado = MODELOS_GROQ[nombre_modelo]
+
     api_key = st.text_input(
         "Groq API key",
         type="password",
         placeholder="gsk_...",
         help="La clave se usa durante la sesión y no se escribe en el código.",
     )
+    if st.button("Probar API y modelo", width="stretch"):
+        if not api_key.strip():
+            st.warning("Escribe primero la Groq API key.")
+        else:
+            try:
+                cliente_prueba = Groq(api_key=api_key.strip())
+                cliente_prueba.models.retrieve(modelo_seleccionado)
+                st.success("La API key y el acceso al modelo funcionan.")
+            except Exception as error:
+                mostrar_error_groq(
+                    error,
+                    api_key.strip(),
+                    modelo_seleccionado,
+                )
+
     temperatura = st.slider(
         "Creatividad de la interpretación",
         min_value=0.0,
@@ -423,10 +546,11 @@ with st.sidebar:
         width="stretch",
     )
     st.caption(f"Fuente activa: {origen_datos}")
-    st.warning(
-        "Groq anunció el retiro de Llama 3.3 70B para planes free/developer "
-        "el 16 de agosto de 2026."
-    )
+    if modelo_seleccionado == "llama-3.3-70b-versatile":
+        st.warning(
+            "Groq anunció el retiro de Llama 3.3 70B para planes "
+            "free/developer el 16 de agosto de 2026."
+        )
 
 if isinstance(intervalo_fechas, (tuple, list)) and len(intervalo_fechas) == 2:
     fecha_inicio, fecha_fin = intervalo_fechas
@@ -454,6 +578,7 @@ firma_filtros = (
     tuple(estados_seleccionados),
     str(fecha_inicio),
     str(fecha_fin),
+    modelo_seleccionado,
 )
 if "firma_filtros" not in st.session_state:
     st.session_state.firma_filtros = firma_filtros
@@ -755,6 +880,7 @@ with tab_asistente:
         "Las respuestas utilizan los filtros actuales y los cálculos del "
         "dashboard. La API key se escribe en la barra lateral."
     )
+    st.caption(f"Modelo activo: `{modelo_seleccionado}`")
 
     if not st.session_state.mensajes_energia:
         with st.chat_message("assistant"):
@@ -804,6 +930,7 @@ with tab_asistente:
             reporte_tecnologia,
             reporte_operador,
             reporte_estado,
+            pregunta,
         )
         mensajes_recientes = st.session_state.mensajes_energia[
             -(turnos_memoria * 2) :
@@ -823,7 +950,7 @@ with tab_asistente:
             try:
                 cliente = Groq(api_key=api_key.strip())
                 flujo = cliente.chat.completions.create(
-                    model=MODELO_GROQ,
+                    model=modelo_seleccionado,
                     messages=mensajes_api,
                     temperature=temperatura,
                     max_completion_tokens=max_tokens,
@@ -849,10 +976,8 @@ with tab_asistente:
             except Exception as error:
                 st.session_state.mensajes_energia.pop()
                 contenedor_respuesta.empty()
-                st.error(
-                    "No fue posible consultar Groq. "
-                    f"Tipo de error: {type(error).__name__}. "
-                    "Revisa la API key, los límites de tu cuenta y la "
-                    "disponibilidad del modelo."
+                mostrar_error_groq(
+                    error,
+                    api_key.strip(),
+                    modelo_seleccionado,
                 )
-
